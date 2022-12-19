@@ -1,5 +1,5 @@
 use termion::color;
-#[derive(PartialEq, Clone, Copy, Debug)]
+#[derive(PartialEq, Clone, Copy)]
 pub enum Type {
     None,
     Number,

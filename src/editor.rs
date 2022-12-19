@@ -1,16 +1,31 @@
 use crate::Document;
 use crate::Row;
 use crate::Terminal;
+
+
+extern crate clipboard;
+
+use clipboard::ClipboardProvider;
+use clipboard::ClipboardContext;
+
 use std::env;
-use std::time::Duration;
-use std::time::Instant;
+use std::fs;
+
+use std::time::{Duration, SystemTime, Instant};
 use termion::color;
 use termion::event::Key;
+use std::io::{Error, Write};
 
 const STATUS_FG_COLOR: color::Rgb = color::Rgb(63, 63, 63);
-const STATUS_BG_COLOR: color::Rgb = color::Rgb(239, 239, 239);
+const STATUS_BG_COLOR: color::Rgb = color::Rgb(239, 239, 239); //const STATUS_BG_COLOR: color::Rgb = color::Rgb(39, 40, 34);
+const BG_COLOR: color::Rgb = color::Rgb(239, 239, 239); //const BG_COLOR: color::Rgb = color::Rgb(39, 40, 34);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const QUIT_TIMES: u8 = 3;
+const BACKUP_AT:u32 = 10;
+const CACHE_FILE:&str="tmp";
+
+const SET_BG:bool = false;
+
 
 #[derive(PartialEq, Copy, Clone)]
 pub enum SearchDirection {
@@ -46,33 +61,38 @@ pub struct Editor {
     status_message: StatusMessage,
     quit_times: u8,
     highlighted_word: Option<String>,
+    since_last_backup:u32,
+    editor_cache:String,
+    init_time:SystemTime,
 }
 
 impl Editor {
     pub fn run(&mut self) {
         loop {
-            if let Err(error) = self.refresh_screen() {
+            if let Err(error) = self.refresh_ui() {
+                self.backup();
                 die(error);
             }
-            if self.should_quit {
-                break;
-            }
-            if let Err(error) = self.process_keypress() {
-                die(error);
-            }
+            let keep_alive = self.process_keypress();
+            match keep_alive {
+                Ok(true) => {},
+                Err(e) => { die(e); },
+                Ok(false) => break
+            }  
         }
+        Terminal::clear_screen();
+        print!("\n\n");
     }
     pub fn default() -> Self {
         let args: Vec<String> = env::args().collect();
-        let mut initial_status =
-            String::from("HELP: Ctrl-F = find | Ctrl-S = save | Ctrl-Q = quit");
+        let mut initial_status = String::from("ctrl-f:'find' | ctrl-s:'save' | ctrl-q:'quit' | ctrl-b:'temporary backup'");
 
         let document = if let Some(file_name) = args.get(1) {
             let doc = Document::open(file_name);
             if let Ok(doc) = doc {
                 doc
             } else {
-                initial_status = format!("ERR: Could not open file: {}", file_name);
+                initial_status = format!("__err__: cannot open: {}", file_name);
                 Document::default()
             }
         } else {
@@ -81,64 +101,117 @@ impl Editor {
 
         Self {
             should_quit: false,
-            terminal: Terminal::default().expect("Failed to initialize terminal"),
+            terminal: Terminal::default().expect("__could_not_initialize_terminal__"),
             document,
             cursor_position: Position::default(),
             offset: Position::default(),
             status_message: StatusMessage::from(initial_status),
             quit_times: QUIT_TIMES,
             highlighted_word: None,
+            since_last_backup: 0,
+            editor_cache: CACHE_FILE.to_string(),
+            init_time: SystemTime::now(), 
         }
     }
 
-    fn refresh_screen(&mut self) -> Result<(), std::io::Error> {
+
+    fn refresh_ui(&mut self) -> Result<(), std::io::Error> {
         Terminal::cursor_hide();
         Terminal::cursor_position(&Position::default());
-        if self.should_quit {
-            Terminal::clear_screen();
-            println!("Goodbye.\r");
-        } else {
-            self.document.highlight(
-                &self.highlighted_word,
-                Some(
-                    self.offset
-                        .y
-                        .saturating_add(self.terminal.size().height as usize),
-                ),
-            );
-            self.draw_rows();
-            self.draw_status_bar();
-            self.draw_message_bar();
-            Terminal::cursor_position(&Position {
-                x: self.cursor_position.x.saturating_sub(self.offset.x),
-                y: self.cursor_position.y.saturating_sub(self.offset.y),
-            });
-        }
+        self.document.highlight(
+            &self.highlighted_word,
+            Some(self.offset.y.saturating_add(self.terminal.size().height as usize),),
+        );
+        self.draw_rows();
+        self.draw_status_bar();
+        self.draw_message_bar();
+        Terminal::cursor_position(&Position {
+            x: self.cursor_position.x.saturating_sub(self.offset.x),
+            y: self.cursor_position.y.saturating_sub(self.offset.y),
+        });
+        
         Terminal::cursor_show();
         Terminal::flush()
     }
     fn save(&mut self) {
         if self.document.file_name.is_none() {
-            let new_name = self.prompt("Save as: ", |_, _, _| {}).unwrap_or(None);
+            let new_name = self.prompt("__save_as__: ", |_, _, _| {}).unwrap_or(None);
             if new_name.is_none() {
-                self.status_message = StatusMessage::from("Save aborted.".to_string());
+                self.status("__save_aborted__", true);
                 return;
             }
             self.document.file_name = new_name;
         }
 
         if self.document.save().is_ok() {
-            self.status_message = StatusMessage::from("File saved successfully.".to_string());
+            self.status("__save_ok__", false);
         } else {
-            self.status_message = StatusMessage::from("Error writing file!".to_string());
+            self.status("__error_saving__", false);
         }
     }
+    fn paste(&mut self){
+        let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
+        let data = ctx.get_contents().unwrap();
+        self.status("__pasted__", false);
+        for e in data.chars().rev() {
+            self.document.insert(&self.cursor_position, e);
+        }
+    }
+    fn backup(&mut self){
+        let doc = &self.document;
+        let cache_file = if let Some(fname) = &doc.file_name {
+            format!("{}.tmp", fname)
+        } else {
+            self.editor_cache.clone()
+        };
+        let mut file = fs::File::create(&cache_file).unwrap();
+        let lines = doc.doc_read();
+        let mut all_ok = true;
+        for line in lines  {
+            if let Ok(_) =  file.write_all(line.as_bytes()){
+              file.write_all(b"\n");
+            } else {
+              all_ok = false;
+            }
+        }
+        if all_ok {
+            self.status(&format!("__backed_up__:{}", &cache_file), false);
+            self.since_last_backup = 0;
+        }
+    }
+
+    fn command_mode(&mut self){
+        let mut command = String::from("::");
+        loop {
+            if let Ok(k) = Terminal::read_key() {
+                match k {
+                    Key::Char(c) => { 
+                        self.status(&command, true);
+                        command.push(c);
+                
+                    },
+                    _ => break
+                }
+            }
+        }
+    }
+    
+    fn status(&mut self, msg:&str, refresh:bool){
+        if let Ok(elapsed) = self.init_time.elapsed() {
+            self.status_message = StatusMessage::from(format!("[{}] {}", elapsed.as_secs(), msg));
+        } else {
+            self.status_message = StatusMessage::from(format!("{}", msg))
+        }
+        if(refresh){ self.refresh_ui(); }
+    }
+
+
     fn search(&mut self) {
         let old_position = self.cursor_position.clone();
         let mut direction = SearchDirection::Forward;
         let query = self
             .prompt(
-                "Search (ESC to cancel, Arrows to navigate): ",
+                "search (esc:cancel, arrows:navigate): ",
                 |editor, key, query| {
                     let mut moved = false;
                     match key {
@@ -171,22 +244,26 @@ impl Editor {
         }
         self.highlighted_word = None;
     }
-    fn process_keypress(&mut self) -> Result<(), std::io::Error> {
+    fn process_keypress(&mut self) -> Result<bool, std::io::Error> {
         let pressed_key = Terminal::read_key()?;
+        self.since_last_backup += 1;
+        if self.since_last_backup >= BACKUP_AT {
+            self.backup();
+        }
         match pressed_key {
             Key::Ctrl('q') => {
                 if self.quit_times > 0 && self.document.is_dirty() {
-                    self.status_message = StatusMessage::from(format!(
-                        "WARNING! File has unsaved changes. Press Ctrl-Q {} more times to quit.",
-                        self.quit_times
-                    ));
+                    self.status(&format!("__warn__:unsaved changes. hit ctrl-q {} more times to quit.", self.quit_times), true);
                     self.quit_times -= 1;
-                    return Ok(());
+                    return Ok(self.quit_times > 0);
                 }
                 self.should_quit = true
             }
             Key::Ctrl('s') => self.save(),
             Key::Ctrl('f') => self.search(),
+            Key::Ctrl('b') => self.backup(),
+            Key::Ctrl('v') => self.paste(),
+            Key::Ctrl('x') => self.command_mode(),
             Key::Char(c) => {
                 self.document.insert(&self.cursor_position, c);
                 self.move_cursor(Key::Right);
@@ -213,7 +290,7 @@ impl Editor {
             self.quit_times = QUIT_TIMES;
             self.status_message = StatusMessage::from(String::new());
         }
-        Ok(())
+        Ok(true)
     }
     fn scroll(&mut self) {
         let Position { x, y } = self.cursor_position;
@@ -297,7 +374,7 @@ impl Editor {
         self.cursor_position = Position { x, y }
     }
     fn draw_welcome_message(&self) {
-        let mut welcome_message = format!("Hecto editor -- version {}", VERSION);
+        let mut welcome_message = format!("editrs v{}", VERSION);
         let width = self.terminal.size().width as usize;
         let len = welcome_message.len();
         #[allow(clippy::integer_arithmetic, clippy::integer_division)]
@@ -318,6 +395,7 @@ impl Editor {
     fn draw_rows(&self) {
         let height = self.terminal.size().height;
         for terminal_row in 0..height {
+            //Terminal::set_bg_color(BG_COLOR);
             Terminal::clear_current_line();
             if let Some(row) = self
                 .document
@@ -330,6 +408,7 @@ impl Editor {
                 println!("~\r");
             }
         }
+        
     }
     fn draw_status_bar(&self) {
         let mut status;
@@ -363,13 +442,14 @@ impl Editor {
         status.push_str(&" ".repeat(width.saturating_sub(len)));
         status = format!("{}{}", status, line_indicator);
         status.truncate(width);
-        Terminal::set_bg_color(STATUS_BG_COLOR);
+        //Terminal::set_bg_color(BG_COLOR);
         Terminal::set_fg_color(STATUS_FG_COLOR);
         println!("{}\r", status);
         Terminal::reset_fg_color();
-        Terminal::reset_bg_color();
+        Terminal::reset_bg_color();;
     }
     fn draw_message_bar(&self) {
+        //Terminal::set_bg_color(BG_COLOR);
         Terminal::clear_current_line();
         let message = &self.status_message;
         if Instant::now() - message.time < Duration::new(5, 0) {
@@ -377,6 +457,11 @@ impl Editor {
             text.truncate(self.terminal.size().width as usize);
             print!("{}", text);
         }
+        //for e in 1..5 {
+        //   Terminal::set_bg_color(BG_COLOR);
+        //    Terminal::clear_current_line();
+        //    println!("...");
+        //}
     }
     fn prompt<C>(&mut self, prompt: &str, mut callback: C) -> Result<Option<String>, std::io::Error>
     where
@@ -384,8 +469,7 @@ impl Editor {
     {
         let mut result = String::new();
         loop {
-            self.status_message = StatusMessage::from(format!("{}{}", prompt, result));
-            self.refresh_screen()?;
+            self.status(&format!("{}{}", prompt, result), true);
             let key = Terminal::read_key()?;
             match key {
                 Key::Backspace => result.truncate(result.len().saturating_sub(1)),
@@ -403,7 +487,7 @@ impl Editor {
             }
             callback(self, key, &result);
         }
-        self.status_message = StatusMessage::from(String::new());
+        self.status("", false);
         if result.is_empty() {
             return Ok(None);
         }
